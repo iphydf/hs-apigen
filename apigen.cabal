@@ -18,21 +18,28 @@ source-repository head
 library
   default-language: Haskell2010
   exposed-modules:
-    Apigen.Language.Apidsl
+    Apigen.Inference
+    Apigen.Language.C
+    Apigen.Language.Cpp
+    Apigen.Language.Cpp.AST
+    Apigen.Language.Cpp.Pretty
     Apigen.Language.Haskell
-    Apigen.Language.PyDsl
+    Apigen.Language.Haskell.AST
+    Apigen.Language.Haskell.Pretty
+    Apigen.Language.Python
+    Apigen.Language.Python.AST
+    Apigen.Language.Python.Pretty
+    Apigen.Language.Rust
+    Apigen.Language.Rust.AST
+    Apigen.Language.Rust.Pretty
     Apigen.Parser
-    Apigen.Parser.InferClasses
-    Apigen.Parser.InferGenerated
-    Apigen.Parser.InferNamespace
-    Apigen.Parser.InferProperties
-    Apigen.Parser.InferSections
-    Apigen.Parser.InferSizedGet
-    Apigen.Parser.InferSizedParam
+    Apigen.Parser.AST
+    Apigen.Parser.Semantic
     Apigen.Parser.Query
     Apigen.Parser.SymbolNumbers
     Apigen.Parser.SymbolTable
     Apigen.Patterns
+    Apigen.Semantic
     Apigen.Types
 
   ghc-options:      -Wall
@@ -42,13 +49,16 @@ library
     , aeson
     , casing          <0.2
     , cimple          >=0.0.19
+    , containers
     , data-fix        <0.4
     , extra
+    , filepath
     , insert-ordered-containers
     , mtl             <3
     , prettyprinter
     , prettyprinter-ansi-terminal
     , text            <3
+    , transformers
     , unordered-containers
 
 executable apigen
@@ -58,22 +68,16 @@ executable apigen
   main-is:          apigen.hs
   build-depends:
       base      <5
-    , apigen
-    , cimple
-    , text
-
-executable dump-model
-  default-language: Haskell2010
-  hs-source-dirs:   tools
-  ghc-options:      -Wall
-  main-is:          dump-model.hs
-  build-depends:
-      base      <5
     , aeson
+    , aeson-pretty
     , apigen
     , bytestring
     , cimple
+    , directory
+    , filepath
+    , optparse-applicative
     , text
+
 
 test-suite testsuite
   type:               exitcode-stdio-1.0
@@ -81,7 +85,10 @@ test-suite testsuite
   hs-source-dirs:     test
   main-is:            testsuite.hs
   other-modules:
+    Apigen.Language.CppSpec
     Apigen.Language.HaskellSpec
+    Apigen.Parser.SemanticSpec
+    Apigen.RoundtripSpec
 
   ghc-options:        -Wall -Wno-unused-imports
   build-tool-depends: hspec-discover:hspec-discover
@@ -89,5 +96,7 @@ test-suite testsuite
       base      <5
     , apigen
     , cimple
+    , data-fix
+    , directory
     , hspec     <3
     , text

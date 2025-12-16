@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Apigen.Parser.SymbolTable where
 
-import           Apigen.Types               (Decl)
+import           Apigen.Parser.AST          (Decl)
 import           Control.Arrow              (Arrow (first))
 import           Control.Monad.State.Strict (State)
 import qualified Control.Monad.State.Strict as State
@@ -13,6 +13,7 @@ import qualified Data.Maybe                 as Maybe
 import           Data.Text                  (Text)
 import qualified Data.Text                  as Text
 import           Data.Tuple.Extra           (both)
+import           Language.Cimple            (Lexeme)
 import           Language.Cimple            (Lexeme)
 
 type Name = ([Text], [Text])
