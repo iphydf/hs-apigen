@@ -19,25 +19,57 @@ haskell_library(
         "//third_party/haskell:aeson",
         "//third_party/haskell:base",
         "//third_party/haskell:casing",
+        "//third_party/haskell:containers",
         "//third_party/haskell:data-fix",
         "//third_party/haskell:extra",
+        "//third_party/haskell:filepath",
         "//third_party/haskell:insert-ordered-containers",
         "//third_party/haskell:mtl",
         "//third_party/haskell:prettyprinter",
         "//third_party/haskell:prettyprinter-ansi-terminal",
         "//third_party/haskell:text",
+        "//third_party/haskell:transformers",
         "//third_party/haskell:unordered-containers",
     ],
 )
 
 hspec_test(
     name = "testsuite",
-    size = "small",
+    size = "medium",
+    data = glob(["src/**/*.hs"]) + [
+        "//c-toxcore:public_headers",
+    ],
     deps = [
         ":hs-apigen",
         "//hs-cimple",
         "//third_party/haskell:base",
+        "//third_party/haskell:bytestring",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:directory",
+        "//third_party/haskell:filepath",
         "//third_party/haskell:hspec",
         "//third_party/haskell:text",
     ],
+)
+
+# The headers the bindings read.
+HEADERS = [
+    "//c-toxcore:tox/tox.h",
+    "//c-toxcore:tox/tox_attributes.h",
+    "//c-toxcore:tox/tox_event.h",
+    "//c-toxcore:tox/tox_events.h",
+    "//c-toxcore:tox/tox_log_level.h",
+    "//c-toxcore:tox/tox_options.h",
+    "//c-toxcore:tox/toxav.h",
+    "//c-toxcore:tox/toxencryptsave.h",
+]
+
+genrule(
+    name = "model_json",
+    srcs = HEADERS,
+    outs = ["model.json"],
+    cmd = "$(execpath //hs-apigen/tools:apigen) --json $@ $(SRCS)",
+    tags = ["haskell"],
+    tools = ["//hs-apigen/tools:apigen"],
 )

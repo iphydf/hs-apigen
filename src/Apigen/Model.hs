@@ -1,0 +1,257 @@
+{-# LANGUAGE OverloadedStrings #-}
+-- | Lookups in the semantic model that every backend needs.
+module Apigen.Model
+    ( mappingOf
+    , allMethods
+    , findEnum
+    , findResource
+    , idModel
+    , sizeCompanions
+    , defineValue
+    , errorMembers
+    , isSizeCompanion
+    , eventFieldType
+    , nameAfterType
+    , nameIdsAfterTypes
+    , shownName
+    , docsAfterTypes
+    , headerOf
+    , enumIn
+    , callbackIn
+    , isEnumNamer
+    , isOpenEnum
+    , ignoresReturn
+    , arrayTypeOf
+    , unitBase
+    , declaredElsewhere
+    , returnsBorrowed
+    , membersOf
+    , rootMembers
+    , variantTags
+    ) where
+
+import           Apigen.Inference   (findRoot, inferCFunctionMapping)
+import qualified Apigen.Knowledge   as Knowledge
+import           Apigen.Parser.Docs (Docs (..))
+import           Apigen.Semantic
+import           Apigen.SizeExpr    (SizeExpr, sizeName)
+import           Data.List          (find)
+import qualified Data.Map.Strict    as Map
+import           Data.Maybe         (mapMaybe)
+import           Data.Text          (Text)
+import qualified Data.Text          as Text
+import           System.FilePath    (takeFileName)
+
+mappingOf :: SemanticModel -> SResource -> SMethod -> CFunctionMapping
+mappingOf model res m = case methodMapping m of
+    StandardMapping  -> inferCFunctionMapping (resources model) res m
+    CustomMapping cm -> cm
+
+allMethods :: SemanticModel -> [(SResource, SMethod)]
+allMethods model = [ (r, m) | r <- resources model, m <- methods r ]
+
+-- | By semantic or C name.
+findEnum :: SemanticModel -> Text -> Maybe SEnumModel
+findEnum model name =
+    find (\e -> enumSemanticName e == name || enumName e == name) (enums model)
+
+findResource :: SemanticModel -> Text -> Maybe SResource
+findResource model name = find ((== name) . resourceName) (resources model)
+
+-- | By its name or its resource's.
+idModel :: SemanticModel -> Text -> Maybe SIdTypeModel
+idModel model name = case find ((== name) . idName) (idTypes model) of
+    Just i -> Just i
+    Nothing -> case findResource model name of
+        Just SResource{resourceType = ResId (SResourceId i)} ->
+            find ((== i) . idName) (idTypes model)
+        _ -> Nothing
+
+-- | Functions other functions ask for a buffer size.
+sizeCompanions :: SemanticModel -> [Text]
+sizeCompanions model =
+    mapMaybe (\(r, m) -> cSizeFunctionName (mappingOf model r m)) (allMethods model)
+
+isSizeCompanion :: SemanticModel -> Text -> Bool
+isSizeCompanion model name = name `elem` sizeCompanions model
+
+defineValue :: SemanticModel -> Text -> Maybe Int
+defineValue model name = constantValue <$> find ((== name) . constantName) (constants model)
+
+-- | Without the OK.
+errorMembers :: SEnumModel -> [SEnumMember]
+errorMembers e = filter ((/= "OK") . enumMemberName) (enumMembers e)
+
+-- | Type of an event's field, from the callback parameter of that name:
+-- @tox_event_friend_message_get_friend_number@ is @friend_message@'s
+-- @friend_number@. The callback can be the context's, with no registration
+-- the model binds.
+eventFieldType :: SemanticModel -> SResource -> SMethod -> SType
+eventFieldType model r m = case typed ++ fromContext of
+    t : _ -> t
+    []    -> output m
+  where
+    field = Text.stripPrefix (cPrefix r <> "get_") (methodName m)
+    typed =
+        [ paramType p
+        | Just f <- [field]
+        , root <- filter isRoot (resources model)
+        , e <- events root
+        , cPrefix r == eventPrefix root (eventName e)
+        , p <- eventParams e
+        , paramName p `elem` [f, nameAfterType (paramType p) f]
+        ]
+    fromContext =
+        [ paramType p
+        | Just f <- [field]
+        , root <- filter isRoot (resources model)
+        , c <- contextCallbacks (context model)
+        , Just e <- [Text.stripPrefix (cPrefix root) (cbCName c) >>= Text.stripSuffix "_cb"]
+        , cPrefix r == eventPrefix root e
+        , p <- cbParams c
+        , paramName p `elem` [f, nameAfterType (paramType p) f]
+        ]
+    eventPrefix root e = cPrefix root <> "event_" <> e <> "_"
+
+-- | An id's name after its type: @peer_id@ of a @Group_Peer_Number@ is
+-- @peer_number@, also at the end of a longer name like @source_peer_id@ or
+-- @tox_group_self_get_peer_id@. Other names stay.
+nameAfterType :: SType -> Text -> Text
+nameAfterType (SResourceId t) n
+    | [kind, want] <- lastTwo (Text.splitOn "_" (Text.toLower t))
+    , want `elem` idWords
+    , let ws = Text.splitOn "_" n
+    , [k, have] <- lastTwo ws
+    , k == kind
+    , have `elem` idWords
+    , have /= want
+    = Text.intercalate "_" (init ws ++ [want])
+  where
+    idWords = ["id", "number"]
+    lastTwo ws = drop (length ws - 2) ws
+nameAfterType _ n = n
+
+-- | The model with ids named after their types in what bindings show. C
+-- calls keep C's names, which differ where C can't rename yet: the group
+-- events' @peer_id@ (see the TODO in tox.h).
+nameIdsAfterTypes :: SemanticModel -> SemanticModel
+nameIdsAfterTypes model = model
+    { callbacks = map callback (callbacks model)
+    , resources = map resource (resources model)
+    }
+  where
+    param p = p { paramName = nameAfterType (paramType p) (paramName p) }
+    callback c = c { cbParams = map param (cbParams c) }
+    resource r = r
+        { methods = map (method r) (methods r)
+        , properties = map (property r) (properties r)
+        , events = [ e { eventParams = map param (eventParams e) } | e <- events r ]
+        }
+    renamed r m = nameAfterType (eventFieldType model r m) (methodName m)
+    method r m
+        | renamed r m == methodName m = m
+        | otherwise = m { methodName = renamed r m, methodMapping = CustomMapping (mappingOf model r m) }
+    property r p = case find ((propRead p ==) . Just . methodName) (methods r) of
+        Just m | renamed r m /= methodName m -> p
+            { propName = nameAfterType (eventFieldType model r m) (propName p)
+            , propRead = Just (renamed r m)
+            }
+        _ -> p
+
+-- | A declaration's header, without its directory: @toxav.h@.
+headerOf :: Text -> Text
+headerOf = Text.pack . takeFileName . Text.unpack
+
+enumIn :: Text -> SEnumModel -> Bool
+enumIn h e = headerOf (enumFile e) == h
+
+callbackIn :: Text -> SCallbackTypeModel -> Bool
+callbackIn h cb = headerOf (cbFile cb) == h
+
+-- | A static function from an enum to a string: @tox_err_set_info_to_string@.
+isEnumNamer :: SMethod -> Bool
+isEnumNamer m = case map paramType (inputs m) of
+    [SEnum _] -> methodRole m == StaticRole && output m == SString
+    _         -> False
+
+-- | Declared in another header than its resource: toxav.h's old group
+-- calls work on a Tox.
+declaredElsewhere :: SResource -> SMethod -> Bool
+declaredElsewhere r m = headerOf (methodFile m) /= headerOf (resourceFile r)
+
+-- | Gives another resource's handle without making it: @toxav_get_tox@.
+returnsBorrowed :: SResource -> SMethod -> Bool
+returnsBorrowed r m = methodRole m /= Constructor && case output m of
+    SHandle h -> h /= resourceName r
+    _         -> False
+
+-- | A handle and the resources it numbers: a Tox's friends, their files,
+-- its groups and their peers.
+membersOf :: [SResource] -> SResource -> [SResource]
+membersOf allRes h = h :
+    [ r | r@SResource{resourceType = ResId _} <- allRes, findRoot allRes r == resourceName h ]
+
+-- | The C enums saying which member of a variant a value is, like the
+-- events' type. They aren't values a client passes.
+variantTags :: SemanticModel -> [Text]
+variantTags = Knowledge.variantTags
+
+-- | The root handles' members: what a client calls on its Tox.
+rootMembers :: SemanticModel -> [SResource]
+rootMembers model = concatMap (membersOf (resources model)) (filter isRoot (resources model))
+
+-- | An enum C passes as an integer, so it may hold values the header
+-- doesn't name: open enums and flags.
+isOpenEnum :: SEnumModel -> Bool
+isOpenEnum e = enumKind e `elem` [OpenEnum, FlagsEnum]
+
+-- | Whether a function's @bool@ only says it worked, which its error says
+-- too.
+ignoresReturn :: SMethod -> Bool
+ignoresReturn m = methodResultStrategy m == IgnoreReturn
+
+-- | A unit's number, and any other type as it is: @Av_Bit_Rate@ is a
+-- @SUInt 32@.
+unitBase :: SType -> SType
+unitBase t = case t of
+    SScalar _ b -> unitBase b
+    _           -> t
+
+-- | The byte array type a size names: @TOX_PUBLIC_KEY_SIZE@ is @Public_Key@.
+arrayTypeOf :: SemanticModel -> SizeExpr -> Maybe Text
+arrayTypeOf model size = sizeName size >>= (`lookup` arrayTypes model)
+
+-- | A function's C name as bindings name it, after 'nameIdsAfterTypes':
+-- @tox_group_self_get_peer_number@ for @tox_group_self_get_peer_id@.
+shownName :: SemanticModel -> SResource -> SMethod -> Text
+shownName model r m = nameAfterType (eventFieldType model r m) (cFunctionName (mappingOf model r m))
+
+-- | The docs for 'nameIdsAfterTypes': a renamed function's doc is under its
+-- new name too, and a callback's @peer_id@ is documented as @peer_number@.
+docsAfterTypes :: SemanticModel -> Docs -> Docs
+docsAfterTypes model docs = docs
+    { funcDocs = Map.union (Map.mapWithKey params (funcDocs docs)) renamed }
+  where
+    renamed = Map.fromList
+        [ (shownName model r m, d)
+        | (r, m) <- allMethods model
+        , let c = cFunctionName (mappingOf model r m)
+        , shownName model r m /= c
+        , Just d <- [Map.lookup c (funcDocs docs)]
+        ]
+    callbackParams = Map.fromList
+        [ (cbCName c, cbParams c) | c <- callbacks model ++ contextCallbacks (context model) ]
+    params name d = case Map.lookup name callbackParams of
+        Nothing -> d
+        Just ps -> foldr rename d
+            [ (old, paramName p)
+            | p <- ps
+            , old <- documented d
+            , old /= paramName p
+            , nameAfterType (paramType p) old == paramName p
+            ]
+    documented d = [ w | ("@param", w) <- pairs (Text.words d) ]
+    pairs ws = zip ws (drop 1 ws)
+    rename (old, new) =
+        Text.replace ("@param " <> old <> " ") ("@param " <> new <> " ")
+            . Text.replace ("`" <> old <> "`") ("`" <> new <> "`")

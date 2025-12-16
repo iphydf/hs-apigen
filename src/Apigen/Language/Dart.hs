@@ -1,0 +1,1024 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+-- | Dart bindings. Toxcore packs an event's fields in @tox_event.h@
+-- getter order, alone if there's one, otherwise as an array. Only
+-- @tox_av_callbacks.dart@ uses @dart:ffi@, which the web lacks.
+module Apigen.Language.Dart (generate) where
+
+import qualified Apigen.Knowledge          as K
+import           Apigen.Language.Cpp.Names (enumTypeName, enumeratorName,
+                                            idTypeName)
+import           Apigen.Model              (allMethods, arrayTypeOf,
+                                            errorMembers, eventFieldType,
+                                            findEnum, idModel, rootMembers,
+                                            variantTags)
+import           Apigen.Namespace          (namespaces, resourceNamespace,
+                                            rootNamespace, secondaryHandles,
+                                            shortNamespace, splitNamespace,
+                                            stripNamespace)
+import           Apigen.Semantic
+import           Apigen.SizeExpr           (SizeExpr (..))
+import           Control.Monad             (guard)
+import           Data.Char                 (toLower)
+import qualified Data.List                 as List
+import           Data.Maybe                (fromMaybe, isJust, isNothing,
+                                            listToMaybe, mapMaybe)
+import           Data.Text                 (Text)
+import qualified Data.Text                 as Text
+import           System.FilePath           (takeDirectory, takeFileName)
+
+generate :: SemanticModel -> [(FilePath, Text)]
+generate model = map (fmap sortImports)
+    ( [ (Text.unpack (file l "api"), genApi model)
+      , (Text.unpack (file l "constants"), genConstants model)
+      , (Text.unpack (file l "enums"), genEnums model)
+      , (Text.unpack (file l "errors"), genErrors model)
+      , (Text.unpack (file l "ids"), genIds model)
+      , (Text.unpack (file l "options"), genOptions model)
+      ]
+    -- A library with its events in a list, and another library's callbacks.
+    ++ [ (Text.unpack (file l "events"), genEvents model) | isJust (eventVariant model) ]
+    ++ concat
+        [ [ (Text.unpack (file l (avWord l <> "_events")), genAvEvents model)
+          , (Text.unpack (file l (avWord l <> "_callbacks")), genAvCallbacks model) ]
+        | not (Text.null (avWord l)) ]
+    )
+  where
+    l = lib model
+
+-- | The names the templates use, from the model and the package's layout.
+data Lib = Lib
+    { libPackage  :: Text          -- ^ @toxcore@
+    , libPrefix   :: Text          -- ^ The generated files': @tox@.
+    , avWord      :: Text          -- ^ Another library's word: @av@.
+    , rootClass   :: Text          -- ^ @Tox@
+    , avClass     :: Text          -- ^ @ToxAv@
+    , rootC       :: Text          -- ^ @Tox@
+    , avC         :: Text          -- ^ @ToxAV@
+    , optionsC    :: Text          -- ^ @Tox_Options@
+    , rootLib     :: Text          -- ^ The root's header directory: @toxcore@.
+    , avLib       :: Text          -- ^ @toxav@
+    , loader      :: (Text, Text)  -- ^ The module and class loading the C library.
+    , ffi         :: (Text, Text)  -- ^ ffigen's module and class.
+    , eventsBytes :: Text          -- ^ @tox_events_get_bytes@
+    , alwaysOn    :: [Text]        -- ^ The setters of the options always on:
+                                   --   owned data and C's locking.
+    }
+
+lib :: SemanticModel -> Lib
+lib model = Lib
+    { libPackage   = dartPackage (targets model)
+    , libPrefix    = rootNamespace model
+    , avWord       = maybe "" (\r -> shortNamespace nss (fromMaybe "" (resourceNamespace nss r))) av
+    , rootClass    = pascal (rootNamespace model)
+    , avClass      = pascal (rootNamespace model) <> maybe "" (\r -> pascal (shortNamespace nss (fromMaybe "" (resourceNamespace nss r)))) av
+    , rootC        = cName root
+    , avC          = maybe "" cName av
+    , optionsC     = maybe "" cName (one SettingsHandle)
+    , rootLib      = dirOf root
+    , avLib        = maybe "" dirOf av
+    , loader       = dartLibrary (targets model)
+    , ffi          = dartFfi (targets model)
+    , eventsBytes  = maybe "" ((<> "get_bytes") . cPrefix) (one ViewList)
+    , alwaysOn     = [ w | p <- K.alwaysOnOptions model ++ K.lockingOptions model, Just w <- [propWrite p] ]
+    }
+  where
+    nss = namespaces model
+    one = listToMaybe . K.handlesOfKind model
+    av = one LibraryHandle
+    root = fromMaybe (error "Dart: no root") (List.find isRoot (resources model))
+    dirOf r = Text.pack (takeFileName (takeDirectory (Text.unpack (resourceFile r))))
+
+-- | A generated file: @tox_api.dart@.
+file :: Lib -> Text -> Text
+file l name = libPrefix l <> "_" <> name <> ".dart"
+
+-- | An import from the package.
+pkgImport :: Lib -> Text -> Text
+pkgImport l name = "import 'package:" <> libPackage l <> "/" <> name <> "';"
+
+preamble :: Lib -> Text
+preamble l = "// Generated by hs-apigen from the " <> rootLib l <> " headers. Do not edit."
+
+-- | Each block of imports in order, as Dart's @directives_ordering@ wants.
+sortImports :: Text -> Text
+sortImports = Text.unlines . concatMap sortBlock . List.groupBy sameKind . Text.lines
+  where
+    isImport = ("import '" `Text.isPrefixOf`)
+    sameKind a b = isImport a && isImport b
+    sortBlock ls = if all isImport ls then List.sort ls else ls
+
+genConstants :: SemanticModel -> Text
+genConstants model = Text.unlines $
+    preamble (lib model)
+    : [ "const " <> camel (constantName c) <> " = " <> tshow (constantValue c) <> ";"
+      | c <- constants model ]
+
+genIds :: SemanticModel -> Text
+genIds model = Text.unlines $
+    preamble (lib model)
+    : concat [ ["", "extension type const " <> name <> "(int value) implements Object {}"]
+             | name <- map (idTypeName . idName) (List.sortOn idName (idTypes model))
+                       ++ map (unitName . scalarName) (List.sortOn scalarName (scalarTypes model)) ]
+
+-- | A unit's type: @AvBitRate@.
+unitName :: Text -> Text
+unitName = idTypeName
+
+-- | Enums a client sees, apart from the events' types (the decoder reads
+-- them).
+genEnums :: SemanticModel -> Text
+genEnums model = Text.unlines $
+    preamble (lib model)
+    : concat [ "" : enumDecl model e (enumMembers e)
+             | e <- List.sortOn (enumType model . enumName) (enums model)
+             , enumKind e /= ErrorEnum, enumName e `notElem` variantTags model ]
+
+-- | Errors of the functions, without OK (they throw the rest).
+genErrors :: SemanticModel -> Text
+genErrors model = Text.unlines $
+    preamble (lib model)
+    : concat [ "" : enumDecl model e (errorMembers e)
+             | e <- List.sortOn (enumType model . enumName) (enums model)
+             , enumKind e == ErrorEnum, enumName e `elem` used ]
+  where
+    used = [ enumName e | (_, m) <- allMethods model, Just n <- [methodErrorType m], Just e <- [findEnum model n] ]
+
+-- | Open enums and flags take any value, so they are integers with
+-- constants.
+enumDecl :: SemanticModel -> SEnumModel -> [SEnumMember] -> [Text]
+enumDecl model e ms
+    | enumKind e `elem` [OpenEnum, FlagsEnum] =
+        ["extension type const " <> name <> "(int value) implements Object {"]
+        ++ [ "  static const " <> enumerator (enumMemberName m) <> " = " <> name <> "(" <> value m <> ");" | m <- ms ]
+        ++ [ line | enumKind e == FlagsEnum
+                  , line <- [ ""
+                            , "  " <> name <> " operator |(" <> name <> " other) =>"
+                            , "      " <> name <> "(value | other.value);"
+                            , ""
+                            , "  /// All of [flags]."
+                            , "  bool has(" <> name <> " flags) => value & flags.value == flags.value;"
+                            , ""
+                            , "  bool hasAny(" <> name <> " flags) => value & flags.value != 0;"
+                            ] ]
+        ++ ["}"]
+    | otherwise =
+        ["enum " <> name <> " {"]
+        ++ zipWith (\i m -> "  " <> enumerator (enumMemberName m) <> "(" <> value m <> ")" <> (if i == length ms then ";" else ",")) [1 :: Int ..] ms
+        ++
+        [ ""
+        , "  final int value;"
+        , ""
+        , "  const " <> name <> "(this.value);"
+        , ""
+        ]
+        ++ layoutHead ("  static " <> name <> " fromValue(int value) =>") "switch (value) {"
+            (\i -> [ Text.replicate i " " <> value m <> " => " <> enumerator (enumMemberName m) <> "," | m <- ms ]
+                   ++ layout i "_ => throw " (Call "ArgumentError.value" [("", Atom "value"), ("", Atom ("'" <> name <> "'"))]) ",")
+            "};"
+        ++ ["}"]
+  where
+    name = enumType model (enumName e)
+    value = tshow . enumMemberValue
+
+-- | @start open@, the body at the indent it's given, then @close@: how
+-- @dart format@ lays out an arrow function's switch.
+layoutHead :: Text -> Text -> (Int -> [Text]) -> Text -> [Text]
+layoutHead start open body close
+    | fits (start <> " " <> open) = [start <> " " <> open] ++ body 4 ++ ["  " <> close]
+    | otherwise = [start, "      " <> open] ++ body 8 ++ ["      " <> close]
+
+--------------------------------------------------------------------------------
+-- Model
+--------------------------------------------------------------------------------
+
+data Event = Event
+    { evMember :: Text    -- ^ The C enumerator: @TOX_EVENT_FRIEND_MESSAGE@.
+    , evName   :: Text    -- ^ @friendMessage@
+    , evFields :: [Field]
+    }
+
+data Field = Field
+    { fieldName :: Text   -- ^ @friendNumber@
+    , fieldType :: Text   -- ^ @int@
+    , fieldRead :: Expr   -- ^ Unpacks the field from @u@.
+    }
+
+eventVariant :: SemanticModel -> Maybe SVariant
+eventVariant = K.eventsVariant
+
+toxEvents :: SemanticModel -> [Event]
+toxEvents model = maybe [] (\v -> map (event v) (variantMembers v)) (eventVariant model)
+  where
+    event v m = case List.find ((== memberType m) . resourceName) (resources model) of
+        Nothing  -> error $ "Apigen.Language.Dart: no resource " <> Text.unpack (memberType m)
+        Just res -> Event (cEnumerator v m) (camel (memberName m)) (fields model res)
+    cEnumerator v m = fromMaybe (memberName m) $ do
+        e <- findEnum model (variantTypeEnum v)
+        enumMemberCName <$> List.find ((== memberName m) . enumMemberName) (enumMembers e)
+
+fields :: SemanticModel -> SResource -> [Field]
+fields model res = mapMaybe field (methods res)
+  where
+    getPrefix = cPrefix res <> "get_"
+    sizeGetters = [s | CustomMapping cm <- map methodMapping (methods res), Just s <- [cSizeFunctionName cm]]
+    field m
+        | not (getPrefix `Text.isPrefixOf` methodName m) = Nothing
+        | not (null (inputs m)) || methodName m `elem` sizeGetters = Nothing
+        | otherwise = Just $ uncurry (Field (camel name))
+            (typed (methodName m) (valued model (Text.dropEnd 1 (cPrefix res)) name (eventFieldType model res m)))
+      where
+        name = Text.drop (Text.length getPrefix) (methodName m)
+    int = Atom "u.unpackInt()!"
+    typed name ty = case ty of
+        SBool    -> ("bool", Atom "u.unpackBool()!")
+        SInt _   -> ("int", int)
+        SUInt _  -> ("int", int)
+        SSizeT   -> ("int", int)
+        SResourceId n -> (idName' model n, Call (idName' model n) [("", int)])
+        SScalar n _ -> (unitName n, Call (unitName n) [("", int)])
+        SEnum n  -> (enumType model n, fromInt model n int)
+        SFixedBytes size _
+            | Just key <- keyType model size -> (key, Call (key <> ".unpack") [("", Atom "u")])
+        SBytes   -> ("Uint8List", Atom "u.unpackBinary()!")
+        SString  -> ("String", Atom "u.unpackString()!")
+        _        -> error $ "Apigen.Language.Dart: unsupported type of " <> Text.unpack name
+
+-- | A C integer holding an enum's values is that enum.
+valued :: SemanticModel -> Text -> Text -> SType -> SType
+valued model fn param ty = maybe ty SEnum (K.enumParam model (fn, param))
+
+--------------------------------------------------------------------------------
+-- Names
+--------------------------------------------------------------------------------
+
+-- | Names as in C++: @Tox_Message_Type@ is @MessageType@, @Tox_Err_Set_Info@
+-- is @SetInfoError@.
+enumType :: SemanticModel -> Text -> Text
+enumType model n = enumTypeName (namespaces model) (maybe n enumName (findEnum model n))
+
+-- | @NOT_FOUND@ is @notFound@.
+enumerator :: Text -> Text
+enumerator m = case m of
+    "NULL" -> "nullArgument"  -- @null@ is a keyword.
+    _      -> lowerFirst (enumeratorName m)
+  where
+    lowerFirst t = maybe t (\(c, rest) -> Text.cons (toLower c) rest) (Text.uncons t)
+
+-- | @Friend_Number@ is @FriendNumber@.
+idName' :: SemanticModel -> Text -> Text
+idName' model n = idTypeName (maybe n idName (idModel model n))
+
+-- | Enum value from its C value @x@.
+fromInt :: SemanticModel -> Text -> Expr -> Expr
+fromInt model n x = case findEnum model n of
+    Just e | enumKind e `elem` [OpenEnum, FlagsEnum] -> Call (enumType model n) [("", x)]
+    _ -> Call (enumType model n <> ".fromValue") [("", x)]
+
+-- | Event types that toxcore never packs, such as @TOX_EVENT_INVALID@.
+nonEvents :: SemanticModel -> [Text]
+nonEvents model = case eventVariant model of
+    Nothing -> []
+    Just v  -> [ enumMemberCName m
+               | Just e <- [findEnum model (variantTypeEnum v)]
+               , m <- enumMembers e
+               , enumMemberName m `notElem` map memberName (variantMembers v)
+               ]
+
+--------------------------------------------------------------------------------
+-- Output
+--------------------------------------------------------------------------------
+
+genEvents :: SemanticModel -> Text
+genEvents model = Text.unlines $
+    [ preamble (lib model)
+    , "// coverage:ignore-file"
+    , "import 'dart:typed_data';"
+    , ""
+    , pkgImport (lib model) (file (lib model) "enums")
+    , pkgImport (lib model) (file (lib model) "ids")
+    , pkgImport (lib model) (fst (loader (lib model)))
+    ]
+    ++ [pkgImport (lib model) "crypto.dart" | uses "PublicKey"]
+    ++
+    [ pkgImport (lib model) "messagepack.dart"
+    , "import 'package:freezed_annotation/freezed_annotation.dart';"
+    , ""
+    , "part '" <> Text.replace ".dart" ".freezed.dart" (file (lib model) "events") <> "';"
+    , ""
+    , "@freezed"
+    , "sealed class Event with _$Event {"
+    ]
+    ++ List.intercalate [""] (map (factory (pascal (rootNamespace model)) "Event") evs)
+    ++
+    [ "}"
+    , ""
+    , "/// Unpacks the bytes of `" <> eventsBytes (lib model) <> "`. An event these bindings"
+    , "/// can't read, of a kind or value newer than they are, is left out, so the"
+    , "/// rest still come."
+    , "List<Event> unpackEvents(Unpacker u) => ["
+    , "  for (var i = u.unpackListLength(); i > 0; i--)"
+    , "    ?_tryUnpackEvent(u.takeValue()),"
+    , "];"
+    , ""
+    , "Event? _tryUnpackEvent(Uint8List bytes) {"
+    , "  try {"
+    , "    return _unpackEvent(Unpacker(bytes));"
+    , "  } on FormatException {"
+    , "    return null;"
+    , "  } on ArgumentError {"
+    , "    return null;"
+    , "  }"
+    , "}"
+    , ""
+    , "Event _unpackEvent(Unpacker u) {"
+    , "  _expect(u.unpackListLength(), 2);"
+    , "  return switch (" <> eventTag <> ".fromValue(u.unpackInt()!)) {"
+    ]
+    ++ map arm evs
+    ++ [ "    ." <> m <> " => throw const FormatException('Not an event')," | m <- nonEvents model ]
+    ++
+    [ "  };"
+    , "}"
+    ]
+    ++ concatMap decoder evs
+    ++
+    [ ""
+    , "void _expect(int length, int expected) {"
+    , "  if (length != expected) {"
+    , "    throw FormatException('Expected $expected fields, got $length');"
+    , "  }"
+    , "}"
+    ]
+  where
+    evs = toxEvents model
+    uses t = any ((== t) . fieldType) (concatMap evFields evs)
+    eventTag = case eventVariant model >>= findEnum model . variantTypeEnum of
+        Just e  -> enumName e
+        Nothing -> error "genEvents: no event type enum"
+
+-- | @prefix@ starts the class names: @ToxEventFriendName@.
+factory :: Text -> Text -> Event -> [Text]
+factory prefix base ev
+    | fits oneLine = [oneLine]
+    | fits broken  = [broken, "      " <> cls <> ";"]
+    | otherwise    = ["  const factory " <> base <> "." <> evName ev <> "({"]
+                     ++ map (\p -> "    " <> p <> ",") params
+                     ++ ["  }) = " <> cls <> ";"]
+  where
+    cls = prefix <> base <> pascal (evName ev)
+    params = ["required " <> fieldType f <> " " <> fieldName f | f <- evFields ev]
+    broken = "  const factory " <> base <> "." <> evName ev <> "({" <> Text.intercalate ", " params <> "}) ="
+    oneLine = broken <> " " <> cls <> ";"
+
+arm :: Event -> Text
+arm ev = "    ." <> evMember ev <> " => _" <> evName ev <> "(u),"
+
+decoder :: Event -> [Text]
+decoder ev =
+    [ ""
+    , "Event _" <> evName ev <> "(Unpacker u) {"
+    ]
+    ++ [ "  _expect(u.unpackListLength(), " <> tshow n <> ");" | n > 1 ]
+    ++ layout 2 "return " (Call ("Event." <> evName ev) [(fieldName f <> ": ", fieldRead f) | f <- evFields ev]) ";"
+    ++ ["}"]
+  where
+    n = length (evFields ev)
+
+--------------------------------------------------------------------------------
+-- API
+--------------------------------------------------------------------------------
+
+data DartType = DartType
+    { dtName   :: Text
+    , dtPass   :: Text -> Text  -- ^ C argument for a Dart value.
+    , dtRead   :: Text -> Text  -- ^ Dart value of bytes read into @out@.
+    , dtResult :: Maybe (Text -> Text)
+      -- ^ Dart value of a C result, if it's not the same.
+    , dtBytes  :: Bool          -- ^ Passed as a buffer with a length.
+    , dtArena  :: Bool          -- ^ Passed in native memory.
+    }
+
+plain :: Text -> DartType
+plain n = DartType n id id Nothing False False
+
+-- | Dart value around a C integer.
+wrapped :: Text -> (Text -> Text) -> DartType
+wrapped n from = DartType n (<> ".value") id (Just from) False False
+
+inArena :: Text -> (Text -> Text) -> DartType
+inArena n pass = DartType n pass id Nothing False True
+
+dartType :: SemanticModel -> SType -> Maybe DartType
+dartType model ty = case ty of
+    SBool         -> Just (plain "bool")
+    SInt _        -> Just (plain "int")
+    SUInt _       -> Just (plain "int")
+    SSizeT        -> Just (plain "int")
+    SResourceId n -> Just (wrapped (idName' model n) (\v -> idName' model n <> "(" <> v <> ")"))
+    SScalar n _   -> Just (wrapped (unitName n) (\v -> unitName n <> "(" <> v <> ")"))
+    SEnum n       -> Just $ case findEnum model n of
+        Just e | enumKind e `elem` [OpenEnum, FlagsEnum] ->
+            wrapped name (\v -> name <> "(" <> v <> ")")
+        -- ffigen's enum in C.
+        _ -> (wrapped name (\v -> name <> ".fromValue(" <> v <> ".value)"))
+            { dtPass = \v -> maybe n enumName (findEnum model n) <> ".fromValue(" <> v <> ".value)" }
+      where name = enumType model n
+    SString       -> Just (inArena "String" (\v -> "a.string(" <> v <> ")"))
+    SBytes        -> Just ((inArena "Uint8List" (\v -> "a.bytes(" <> v <> ")")) { dtBytes = True })
+    SFixedBytes size _ -> Just $ case keyType model size of
+        Just key -> (inArena key (\v -> "a.bytes(" <> v <> ".bytes)")) { dtRead = \v -> key <> "(" <> v <> ")" }
+        Nothing  -> inArena "Uint8List" (\v -> "a.bytes(" <> v <> ")")
+    SList (SResourceId n) -> Just (plain ("List<" <> idName' model n <> ">"))
+    SFixedList (SInt 16) _ _ -> Just (inArena "Int16List" (\v -> "a.int16s(" <> v <> ")"))
+    _             -> Nothing
+
+-- | A parameter's type, which may be null if C takes NULL.
+paramDartType :: SemanticModel -> Text -> SParameter -> Maybe DartType
+paramDartType model fn p = do
+    t <- dartType model (valued model fn (paramName p) (paramType p))
+    pure $ if paramNullable p
+        then t { dtName = dtName t <> "?", dtPass = \v -> v <> " == null ? nullptr : " <> dtPass t v }
+        else t
+
+-- | The hand-written class an array type is: @PublicKey@ for
+-- @TOX_PUBLIC_KEY_SIZE@.
+keyType :: SemanticModel -> SizeExpr -> Maybe Text
+keyType model size = arrayTypeOf model size >>= (`lookup` dartKeyClasses (targets model))
+
+data ApiMethod = ApiMethod
+    { amSignature :: (Text, Text, [(Text, Text)])  -- ^ Return type, name, parameters.
+    , amBody      :: [Text]                         -- ^ Statements, at 4 spaces.
+    }
+
+-- | The other libraries' functions, apart from creating, iterating and
+-- killing their handles.
+avResources :: SemanticModel -> [Text]
+avResources = map resourceName . secondaryHandles
+
+apiMethods :: [Text] -> SemanticModel -> [ApiMethod]
+apiMethods names model =
+    [ m | res <- resources model, resourceName res `elem` names
+        , let sizeFns = [s | CustomMapping cm <- map methodMapping (methods res), Just s <- [cSizeFunctionName cm]]
+        , meth <- methods res
+        , methodRole meth `elem` [ActionRole, Constructor]
+        , methodName meth `notElem` sizeFns
+        -- Its result would be C's failure code.
+        , isNothing (K.failureReturn model (methodName meth))
+        , Just m <- [apiMethod model res meth] ]
+
+-- | Ids of a resource and its parents, outermost first: @(name, type)@.
+pathIds :: SemanticModel -> SResource -> [(Text, Text)]
+pathIds model res = reverse (go res)
+  where
+    go r = case (parent r, resourceType r) of
+        (Just p, ResId (SResourceId i)) ->
+            (camel (maybe i idName (idModel model i)), idName' model i)
+            : maybe [] go (List.find ((== p) . resourceName) (resources model))
+        _ -> []
+
+apiMethod :: SemanticModel -> SResource -> SMethod -> Maybe ApiMethod
+apiMethod model res meth = do
+    CustomMapping cm <- Just (methodMapping meth)
+    inTypes <- mapM (paramDartType model (methodName meth)) (inputs meth)
+    let ids = pathIds model res
+        inNames = map (camel . paramName) (inputs meth)
+        bufferOut = any isBuffer (argMapping cm)
+        isBuffer (BufferPtr _) = True
+        isBuffer _             = False
+        ignore = methodResultStrategy meth == IgnoreReturn || output meth == SVoid
+    outType <- if ignore then Just Nothing else Just <$> dartType model (output meth)
+    let errorCheck fn = case methodErrorType meth of
+            Nothing -> []
+            Just e  -> layout ind "" (Call "_check"
+                [ ("", Atom "err.value")
+                , ("", Atom (enumType model e <> ".fromValue"))
+                , ("", Atom ("'" <> fn <> "'"))
+                ]) ";"
+        args mapping = go mapping Nothing
+          where
+            go [] _ = []
+            go (a : as) lastBytes = case a of
+                ThisObject _   -> Atom "pointer" : go as lastBytes
+                PathObject _ _ -> Atom "pointer" : go as lastBytes
+                PathId n       -> Atom (fst (ids !! (n - 1)) <> ".value") : go as lastBytes
+                SemanticArg i  ->
+                    let t = inTypes !! i; v = inNames !! i
+                    in Atom (dtPass t v) : go as (if dtBytes t then Just v else lastBytes)
+                BufferSize _   -> Atom (maybe "0" (<> ".length") lastBytes) : go as lastBytes
+                BufferPtr _    -> Atom "out" : go as lastBytes
+                ErrorPtr       -> Atom "err" : go as lastBytes
+                _              -> Atom "null" : go as lastBytes
+        call fn mapping = Call ("lib.ffi." <> fn) [("", e) | e <- args mapping]
+        sizeMethod = cSizeFunctionName cm >>= \s -> List.find ((== s) . methodName) (methods res)
+        sizeArgs = case sizeMethod >>= \sm -> case methodMapping sm of
+                        CustomMapping scm -> Just (argMapping scm)
+                        _                 -> Nothing of
+            Just m  -> m
+            Nothing -> []
+        needsArena = isJust (methodErrorType meth) || bufferOut || any dtArena inTypes
+        bufferSize = case [s | BufferPtr (Just s) <- argMapping cm] of
+            s : _ -> Just (sizeExpr s)
+            []    -> Nothing
+        outBody = case output meth of
+            SList _ -> [pad <> "final out = a.ids(size);"]
+            _       -> [pad <> "final out = a.buffer(" <> fromMaybe "size" bufferSize <> ");"]
+        sizeBody = case (bufferSize, sizeMethod) of
+            (Nothing, Just sm) ->
+                layout ind "final size = " (call (methodName sm) sizeArgs) ";"
+                ++ (case methodErrorType sm of
+                        Nothing -> []
+                        Just _  -> errorCheck (methodName sm))
+            _ -> []
+        readOut = case output meth of
+            SList (SResourceId n) -> "out.asTypedList(size).map(" <> idName' model n <> ".new).toList()"
+            SList _ -> "out.asTypedList(size).toList()"
+            _       -> maybe "_read(out, size)" (\t -> dtRead t ("_read(out, " <> fromMaybe "size" bufferSize <> ")")) outType
+        result = case (bufferOut, outType) of
+            (True, _) ->
+                sizeBody ++ outBody
+                ++ layout ind "" (call (methodName meth) (argMapping cm)) ";"
+                ++ errorCheck (methodName meth)
+                ++ [pad <> "return " <> readOut <> ";"]
+            (False, Nothing) ->
+                layout ind "" (call (methodName meth) (argMapping cm)) ";"
+                ++ errorCheck (methodName meth)
+            (False, Just t)
+                | isJust (methodErrorType meth) || isJust (dtResult t) ->
+                    layout ind "final result = " (call (methodName meth) (argMapping cm)) ";"
+                    ++ errorCheck (methodName meth)
+                    ++ [pad <> "return " <> fromMaybe id (dtResult t) "result" <> ";"]
+                | otherwise -> layout ind "return " (call (methodName meth) (argMapping cm)) ";"
+        -- C reads all of a sized array.
+        checks = concat
+            [ [ "    if (" <> v <> ".length < " <> sizeExprOf units sz <> ") {"
+              , "      throw ArgumentError.value(" <> v <> ".length, '" <> v <> "', 'too short');"
+              , "    }"
+              ]
+            | (p, v) <- zip (inputs meth) inNames
+            , sz <- case paramType p of
+                SFixedList _ sz _                                  -> [sz]
+                SFixedBytes sz _ | Nothing <- arrayTypeOf model sz -> [sz]
+                _                                                  -> []
+            ]
+        units = [ paramName p | p <- inputs meth, SScalar _ _ <- [paramType p] ]
+        body
+            | needsArena =
+                checks ++
+                [ "    final a = _Arena(lib);", "    try {" ]
+                ++ [ "      final err = a.error();" | isJust (methodErrorType meth) ]
+                ++ result
+                ++ [ "    } finally {", "      a.free();", "    }" ]
+            | otherwise = checks ++ result
+        ind = if needsArena then 6 else 4
+        pad = Text.replicate ind " "
+        name = camel (stripNamespace (namespaces model) (methodName meth))
+        params = take (length [() | PathId _ <- argMapping cm]) ids
+                 ++ zip inNames (map dtName inTypes)
+    pure $ ApiMethod (maybe "void" dtName outType, name, params) body
+
+signature :: Text -> (Text, Text, [(Text, Text)]) -> [Text]
+signature end (ret, name, params)
+    | fits line = [line]
+    | otherwise = ["  " <> ret <> " " <> name <> "("]
+                  ++ ["    " <> t <> " " <> n <> "," | (n, t) <- params]
+                  ++ ["  )" <> end]
+  where
+    line = "  " <> ret <> " " <> name <> "(" <> Text.intercalate ", " [t <> " " <> n | (n, t) <- params] <> ")" <> end
+
+genApi :: SemanticModel -> Text
+genApi model = Text.unlines $
+    [ preamble (lib model)
+    , "// coverage:ignore-file"
+    , "import 'dart:convert';"
+    , "import 'dart:typed_data';"
+    , ""
+    , pkgImport (lib model) (file (lib model) "constants")
+    , pkgImport (lib model) (file (lib model) "enums")
+    , pkgImport (lib model) (file (lib model) "errors")
+    , pkgImport (lib model) (file (lib model) "ids")
+    , pkgImport (lib model) (fst (loader (lib model)))
+    , pkgImport (lib model) "crypto.dart"
+    , ""
+    , "final class ApiException<T extends Enum> implements Exception {"
+    , "  final T error;"
+    , "  final String? functionName;"
+    , ""
+    , "  const ApiException(this.error, [this.functionName]);"
+    , ""
+    , "  @override"
+    , "  String toString() => functionName == null"
+    , "      ? 'ApiException: $error'"
+    , "      : 'ApiException: $error in $functionName';"
+    , "}"
+    , ""
+    , "/// The " <> rootLib l <> " functions, apart from creating, iterating and killing a " <> rootClass l <> "."
+    , "abstract interface class " <> rootClass l <> "Api {"
+    ]
+    ++ List.intercalate [""] [signature ";" (amSignature m) | m <- ms]
+    ++
+    [ "}"
+    , ""
+    , "/// [" <> rootClass l <> "Api] through " <> rootLib l <> "'s C functions."
+    , "mixin " <> rootClass l <> "FfiApi implements " <> rootClass l <> "Api {"
+    , "  " <> snd (loader l) <> " get lib;"
+    , ""
+    , "  Pointer<" <> rootC l <> "> get pointer;"
+    ]
+    ++ concat [ "" : "  @override" : signature " {" (amSignature m) ++ amBody m ++ ["  }"] | m <- ms ]
+    ++
+    [ "}"
+    , ""
+    ]
+    -- Another library's handle.
+    ++ concat
+        [ [ "/// The " <> avLib l <> " functions, apart from creating, iterating and killing a " <> avC l <> "."
+          , "abstract interface class " <> avClass l <> "Api {"
+          ]
+          ++ List.intercalate [""] [signature ";" (amSignature m) | m <- avs]
+          ++
+          [ "}"
+          , ""
+          , "/// [" <> avClass l <> "Api] through " <> avLib l <> "'s C functions."
+          , "mixin " <> avClass l <> "FfiApi implements " <> avClass l <> "Api {"
+          , "  " <> snd (loader l) <> " get lib;"
+          , ""
+          , "  Pointer<" <> avC l <> "> get pointer;"
+          ]
+          ++ concat [ "" : "  @override" : signature " {" (amSignature m) ++ amBody m ++ ["  }"] | m <- avs ]
+          ++ [ "}", "" ]
+        | not (Text.null (avWord l)) ]
+    ++
+    [ "void _check<T extends Enum>("
+    , "  int error,"
+    , "  T Function(int) toError,"
+    , "  String function,"
+    , ") {"
+    , "  if (error != 0) {"
+    , "    throw ApiException(toError(error), function);"
+    , "  }"
+    , "}"
+    , ""
+    , "Uint8List _read(Pointer<Uint8> data, int length) =>"
+    , "    Uint8List.fromList(data.asTypedList(length));"
+    , ""
+    , "/// Native memory for one call, freed together afterwards."
+    , "final class _Arena {"
+    , "  final " <> snd (loader l) <> " _lib;"
+    , "  final _pointers = <Pointer<NativeType>>[];"
+    , ""
+    , "  _Arena(this._lib);"
+    , ""
+    , "  Pointer<T> _add<T extends NativeType>(Pointer<T> pointer) {"
+    , "    _pointers.add(pointer);"
+    , "    return pointer;"
+    , "  }"
+    , ""
+    , "  Pointer<CEnum> error() => _add(_lib.allocator<CEnum>());"
+    , ""
+    , "  Pointer<Uint8> buffer(int length) =>"
+    , "      _add(_lib.allocator<Uint8>(length == 0 ? 1 : length));"
+    , ""
+    , "  Pointer<Uint32> ids(int length) =>"
+    , "      _add(_lib.allocator<Uint32>(length == 0 ? 1 : length));"
+    , ""
+    , "  Pointer<Uint8> bytes(List<int> data) {"
+    , "    final pointer = buffer(data.length);"
+    , "    pointer.asTypedList(data.length).setAll(0, data);"
+    , "    return pointer;"
+    , "  }"
+    , ""
+    , "  Pointer<Int16> int16s(List<int> data) {"
+    , "    final pointer = _add(_lib.allocator<Int16>(data.isEmpty ? 1 : data.length));"
+    , "    pointer.asTypedList(data.length).setAll(0, data);"
+    , "    return pointer;"
+    , "  }"
+    , ""
+    , "  Pointer<CChar> string(String value) =>"
+    , "      bytes(utf8.encode('$value\\u0000')).cast();"
+    , ""
+    , "  void free() => _pointers.forEach(_lib.allocator.free);"
+    , "}"
+    ]
+  where
+    l = lib model
+    -- Creating, iterating and killing a Tox is up to the hand-written Toxcore.
+    ms = apiMethods (map resourceName (rootMembers model)) model
+    avs = apiMethods (avResources model) model
+
+--------------------------------------------------------------------------------
+-- Options
+--------------------------------------------------------------------------------
+
+data Option = Option Text Text [Text]
+
+-- | Options with a plain value. Owned data is always on, so toxcore copies
+-- strings and bytes, and so is C's locking (see 'K.lockingOptions'). No
+-- callbacks.
+options :: SemanticModel -> [Option]
+options model = case K.handlesOfKind model SettingsHandle of
+    []      -> []
+    res : _ -> mapMaybe option (properties res)
+  where
+    option p = case (propWrite p, propType p) of
+        (Just set, ty)
+            | p `notElem` K.alwaysOnOptions model, p `notElem` K.lockingOptions model -> do
+                dartTy <- valueType ty
+                let name = camel (propName p)
+                    call args = layout 8 "" (Call ("lib.ffi." <> set) (("", Atom "options") : args)) ";"
+                    owned arg len = layout 8 "" (Call "_owned"
+                        [("", Call ("lib.ffi." <> set) [("", Atom "options"), ("", arg), ("", len)])]) ";"
+                    stmts = case ty of
+                        SString -> layout 8 "" (Call "_owned"
+                            [("", Call ("lib.ffi." <> set) [("", Atom "options"), ("", Atom "copy(utf8.encode('$value\\u0000')).cast()")])]) ";"
+                        SBytes  -> owned (Atom "copy(value)") (Atom "value.length")
+                        _       -> call [("", Atom (maybe "value" (`dtPass` "value") (dartType model ty)))]
+                pure $ Option name dartTy stmts
+        _ -> Nothing
+    valueType ty = case ty of
+        SBool       -> Just "bool"
+        SUInt _     -> Just "int"
+        SInt _      -> Just "int"
+        SEnum n     -> Just (enumType model n)
+        SScalar n _ -> Just (unitName n)
+        SString     -> Just "String"
+        SBytes      -> Just "Uint8List"
+        _           -> Nothing
+
+genOptions :: SemanticModel -> Text
+genOptions model = Text.unlines $
+    [ preamble (lib model)
+    , "import 'dart:convert';"
+    , "import 'dart:typed_data';"
+    , ""
+    , pkgImport (lib model) (file (lib model) "enums")
+    ]
+    ++ [ pkgImport (lib model) (file (lib model) "ids") | any (\(Option _ ty _) -> ty `elem` units) opts ]
+    ++
+    [ pkgImport (lib model) (fst (loader (lib model)))
+    , ""
+    , "/// The options for a new " <> rootClass l <> ". Unset ones keep " <> rootLib l <> "'s defaults."
+    , "final class " <> rootClass l <> "Options {"
+    ]
+    ++ [ "  final " <> ty <> "? " <> name <> ";" | Option name ty _ <- opts ]
+    ++ [ "", "  const " <> rootClass l <> "Options({" ]
+    ++ [ "    this." <> name <> "," | Option name _ _ <- opts ]
+    ++
+    [ "  });"
+    , ""
+    , "  /// Sets the options that are set here on [options], which copies them."
+    , "  void applyTo(" <> snd (loader l) <> " lib, Pointer<" <> optionsC l <> "> options) {"
+    , "    final copies = <Pointer<Uint8>>[];"
+    , "    Pointer<Uint8> copy(List<int> bytes) {"
+    , "      final data = lib.allocator<Uint8>(bytes.length);"
+    , "      data.asTypedList(bytes.length).setAll(0, bytes);"
+    , "      copies.add(data);"
+    , "      return data;"
+    , "    }"
+    , ""
+    , "    try {"
+    ]
+    ++ [ "      lib.ffi." <> setter <> "(options, true);" | setter <- alwaysOn l ]
+    ++ concatMap set opts
+    ++
+    [ "    } finally {"
+    , "      copies.forEach(lib.allocator.free);"
+    , "    }"
+    , "  }"
+    , "}"
+    , ""
+    , "void _owned(bool copied) {"
+    , "  if (!copied) {"
+    , "    throw StateError('" <> optionsC l <> " could not copy its data');"
+    , "  }"
+    , "}"
+    ]
+  where
+    l = lib model
+    opts = options model
+    units = map (unitName . scalarName) (scalarTypes model)
+    set (Option name _ stmts) =
+        ["      if (" <> name <> " case final value?) {"]
+        ++ stmts
+        ++ ["      }"]
+
+--------------------------------------------------------------------------------
+-- toxav callbacks
+--------------------------------------------------------------------------------
+
+data AvCallback = AvCallback
+    { avEvent     :: Event
+    , avRegistrar :: Text         -- ^ @toxav_callback_call@.
+    , avParams    :: [(Text, Text, Text)]
+      -- ^ Every parameter's name, native type and Dart type.
+    }
+
+-- | Callbacks registered with another library's handle, which they take
+-- first. Not one of that library's taking the root's handle though.
+avCallbacks :: SemanticModel -> [AvCallback]
+avCallbacks model = mapMaybe avCallback (callbacks model)
+  where
+    avCallback cb = do
+        (ns, rest) <- splitNamespace (namespaces model) (cbCName cb)
+        stem <- Text.stripSuffix "_cb" rest
+        SHandle h : _ <- Just (map paramType (cbParams cb))
+        handle <- List.find ((== h) . resourceName) (secondaryHandles model)
+        guard (cPrefix handle == ns <> "_")
+        ev <- List.find ((== cbCName cb) . cCallback) (events handle)
+        params <- mapM param (cbParams cb)
+        pure $ AvCallback (Event stem (camel stem) (mapMaybe (field (cbCName cb)) (cbParams cb))) (eventRegistrar ev) params
+    param p = do
+        (native, dart) <- types (paramType p)
+        pure (camel (paramName p), native, dart)
+    types ty = case ty of
+        SHandle h
+            | Just r <- List.find ((== h) . resourceName) (secondaryHandles model)
+                                 -> Just ("Pointer<" <> cName r <> ">", "Pointer<" <> cName r <> ">")
+            | otherwise          -> Just ("Pointer<Void>", "Pointer<Void>")
+        SBool                    -> Just ("Bool", "bool")
+        SUInt n                  -> Just ("Uint" <> tshow n, "int")
+        SInt n                   -> Just ("Int" <> tshow n, "int")
+        SSizeT                   -> Just ("Size", "int")
+        SFixedList (SInt 16) _ _ -> Just ("Pointer<Int16>", "Pointer<Int16>")
+        SFixedBytes _ _          -> Just ("Pointer<Uint8>", "Pointer<Uint8>")
+        SResourceId n            -> idModel model n >>= types . idType
+        SScalar _ t              -> types t
+        _                        -> Nothing
+    -- The event keeps a copy of what the pointers point to.
+    field cb p = let name = camel (paramName p) in case valued model cb (paramName p) (paramType p) of
+        SHandle _ -> Nothing
+        SBool     -> Just (Field name "bool" (Atom name))
+        SResourceId n -> Just (Field name (idName' model n) (Call (idName' model n) [("", Atom name)]))
+        SScalar n _   -> Just (Field name (unitName n) (Call (unitName n) [("", Atom name)]))
+        SEnum n   -> Just (Field name (enumType model n) (fromInt model n (Atom name)))
+        SFixedList (SInt 16) size _ -> Just (Field name "Int16List" (copy "Int16List" name size))
+        SFixedBytes size _          -> Just (Field name "Uint8List" (copy "Uint8List" name size))
+        _         -> Just (Field name "int" (Atom name))
+    copy list name size = Call (list <> ".fromList")
+        [("", Call (name <> ".asTypedList") [("", Atom (sizeExpr size))])]
+
+sizeExpr :: SizeExpr -> Text
+sizeExpr = sizeExprOf []
+
+-- | With these C parameters units, whose number is their @value@.
+sizeExprOf :: [Text] -> SizeExpr -> Text
+sizeExprOf units = expr
+  where
+    expr e = case e of
+        SizeNum n         -> Text.pack (show n)
+        SizeVar v
+            | v `elem` units -> camel v <> ".value"
+            | otherwise      -> camel v
+        -- Sizes are ints divided by @~/@.
+        SizeOp '/' a b    -> operand a <> " ~/ " <> operand b
+        SizeOp op a b     -> operand a <> " " <> Text.singleton op <> " " <> operand b
+        SizeCall "abs" as -> "_abs(" <> Text.intercalate ", " (map expr as) <> ")"
+        SizeCall f as     -> f <> "(" <> Text.intercalate ", " (map expr as) <> ")"
+    operand x = case x of
+        SizeOp{} -> "(" <> expr x <> ")"
+        _        -> expr x
+
+-- | Another library's events: @AvEvent@.
+libraryEventClass :: Lib -> Text
+libraryEventClass l = pascal (avWord l) <> "Event"
+
+genAvEvents :: SemanticModel -> Text
+genAvEvents model = Text.unlines $
+    [ preamble (lib model)
+    , "// coverage:ignore-file"
+    , "import 'dart:typed_data';"
+    , ""
+    , pkgImport (lib model) (file (lib model) "enums")
+    , pkgImport (lib model) (file (lib model) "ids")
+    , "import 'package:freezed_annotation/freezed_annotation.dart';"
+    , ""
+    , "part '" <> Text.replace ".dart" ".freezed.dart" (file (lib model) (avWord (lib model) <> "_events")) <> "';"
+    , ""
+    , "@freezed"
+    , "sealed class " <> evClass <> " with _$" <> evClass <> " {"
+    ]
+    ++ List.intercalate [""] (map (factory (pascal (rootNamespace model)) evClass . avEvent) (avCallbacks model))
+    ++ ["}"]
+  where
+    evClass = libraryEventClass (lib model)
+
+genAvCallbacks :: SemanticModel -> Text
+genAvCallbacks model = Text.unlines $
+    [ preamble (lib model)
+    , "// coverage:ignore-file"
+    , "import 'dart:ffi';"
+    ]
+    ++ ["import 'dart:math';" | uses "max("]
+    ++
+    [ "import 'dart:typed_data';"
+    , ""
+    , pkgImport (lib model) (file (lib model) (avWord (lib model) <> "_events"))
+    , pkgImport (lib model) (file (lib model) "enums")
+    , pkgImport (lib model) (file (lib model) "ids")
+    , pkgImport (lib model) (fst (ffi (lib model)))
+    , ""
+    , "/// Collects " <> avLib l <> "'s callbacks as [" <> evClass <> "]s, while " <> avLib l <> " or " <> rootLib l
+    , "/// iterates."
+    , "final class " <> evClass <> "Collector {"
+    , "  final events = <" <> evClass <> ">[];"
+    , "  late final List<NativeCallable<Function>> _callables;"
+    , ""
+    , "  /// Registers the callbacks with [" <> avWord l <> "]."
+    , "  " <> evClass <> "Collector(" <> snd (ffi l) <> " ffi, Pointer<" <> avC l <> "> " <> avWord l <> ") {"
+    ]
+    ++ concatMap register cbs
+    ++ layoutList 4 "_callables = [" (map (evName . avEvent) cbs) "];"
+    ++
+    [ "  }"
+    , ""
+    , "  /// Only after " <> avLib l <> " is killed, which calls them no more."
+    , "  void close() {"
+    , "    for (final callable in _callables) {"
+    , "      callable.close();"
+    , "    }"
+    , "  }"
+    ]
+    ++ concatMap handler cbs
+    ++ ["}"]
+    ++ concatMap typedef cbs
+    ++ (if uses "_abs(" then ["", "int _abs(int value) => value.abs();"] else [])
+  where
+    l = lib model
+    evClass = libraryEventClass l
+    cbs = avCallbacks model
+    uses t = any (Text.isInfixOf t . flat . fieldRead) (concatMap (evFields . avEvent) cbs)
+    typedefName cb = "_" <> pascal (evName (avEvent cb))
+    register cb =
+        layout 4 ("final " <> evName (avEvent cb) <> " = ")
+            (Call ("NativeCallable<" <> typedefName cb <> ">.isolateLocal")
+                [("", Atom ("_" <> evName (avEvent cb)))]) ";"
+        ++ layout 4 "" (Call ("ffi." <> avRegistrar cb)
+            [("", Atom (avWord l)), ("", Atom (evName (avEvent cb) <> ".nativeFunction")), ("", Atom "nullptr")]) ";"
+    handler cb = "" : case signature "" ("void", "_" <> evName (avEvent cb), [(n, d) | (n, _, d) <- avParams cb]) of
+        [line] -> layout 2 (Text.strip line <> " => ") add ";"
+        sig    -> init sig ++ layout 2 ") => " add ";"
+      where
+        add = Call "events.add"
+            [("", Call (evClass <> "." <> evName (avEvent cb))
+                [(fieldName f <> ": ", fieldRead f) | f <- evFields (avEvent cb)])]
+    typedef cb
+        | fits line = ["", line]
+        | otherwise = ["", start <> " Void Function("]
+                      ++ ["  " <> t <> "," | (_, t, _) <- avParams cb]
+                      ++ [");"]
+      where
+        start = "typedef " <> typedefName cb <> " ="
+        fn = "Void Function(" <> Text.intercalate ", " [t | (_, t, _) <- avParams cb] <> ")"
+        line = start <> " " <> fn <> ";"
+
+layoutList :: Int -> Text -> [Text] -> Text -> [Text]
+layoutList indent lead items trail
+    | fits line = [line]
+    | otherwise = [pad <> lead] ++ ["  " <> pad <> i <> "," | i <- items] ++ [pad <> Text.dropWhile (/= ']') trail]
+  where
+    pad = Text.replicate indent " "
+    line = pad <> lead <> Text.intercalate ", " items <> trail
+
+--------------------------------------------------------------------------------
+-- Layout
+--------------------------------------------------------------------------------
+
+data Expr
+    = Atom Text
+    | Call Text [(Text, Expr)]  -- ^ @f(key: value, ...)@
+
+flat :: Expr -> Text
+flat (Atom t)    = t
+flat (Call f as) = f <> "(" <> Text.intercalate ", " [k <> flat e | (k, e) <- as] <> ")"
+
+-- | Lays out @lead <> expr <> trail@ at @indent@ like @dart format@: on one
+-- line if it fits, otherwise one argument per line.
+layout :: Int -> Text -> Expr -> Text -> [Text]
+layout indent lead expr trail
+    | fits line = [line]
+    | Call f as <- expr =
+        [pad <> lead <> f <> "("]
+        ++ concatMap (\(k, e) -> layout (indent + 2) k e ",") as
+        ++ [pad <> ")" <> trail]
+    | otherwise = [line]
+  where
+    pad = Text.replicate indent " "
+    line = pad <> lead <> flat expr <> trail
+
+fits :: Text -> Bool
+fits = (<= 80) . Text.length
+
+--------------------------------------------------------------------------------
+-- Names
+--------------------------------------------------------------------------------
+
+camel :: Text -> Text
+camel n = case Text.splitOn "_" (Text.toLower n) of
+    []     -> n
+    w : ws -> Text.concat (w : map Text.toTitle ws)
+
+pascal :: Text -> Text
+pascal n = Text.toUpper (Text.take 1 n) <> Text.drop 1 n
+
+tshow :: Show a => a -> Text
+tshow = Text.pack . show
