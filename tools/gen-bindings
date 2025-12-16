@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Regenerate every apigen-produced binding from the c-toxcore headers and
+# test them. Run after changing apigen or the c-toxcore public headers.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+HSAPIGEN_DIR="$(dirname "$SCRIPT_DIR")"
+WORKSPACE_DIR="$(dirname "$HSAPIGEN_DIR")"
+
+set -eux
+
+cd "$WORKSPACE_DIR"
+
+HEADERS=(
+  c-toxcore/toxcore/tox.h
+  c-toxcore/toxcore/tox_attributes.h
+  c-toxcore/toxcore/tox_events.h
+  c-toxcore/toxcore/tox_log_level.h
+  c-toxcore/toxcore/tox_options.h
+  c-toxcore/toxav/toxav.h
+  c-toxcore/toxencryptsave/toxencryptsave.h
+)
+
+bazel build //hs-apigen/tools:apigen
+
+bazel-bin/hs-apigen/tools/apigen \
+  --rs-out rs-toxcore-c/toxcore/src/core/generated \
+  --py-out py_toxcore_c/pytox \
+  --jvm-out jvm-toxcore-c \
+  --dart-out btox/lib/api/toxcore \
+  "${HEADERS[@]}"
+
+# apigen doesn't format its Rust output, and //rs-toxcore-c:rustfmt checks it is.
+bazel run @rules_rust//tools/upstream_wrapper:rustfmt -- --edition 2024 \
+  "$WORKSPACE_DIR"/rs-toxcore-c/toxcore/src/core/generated/*.rs
+
+# Refresh the .pyi stubs from the compiled Cython extension.
+bazel run //py_toxcore_c/tools:stubgen -- py_toxcore_c
+
+bazel test \
+  //hs-apigen/... \
+  //rs-toxcore-c/... \
+  //py_toxcore_c/... \
+  //jvm-toxcore-c/...

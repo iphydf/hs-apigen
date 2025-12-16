@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Apigen.Parser.SymbolTable where
 
-import           Apigen.Types               (Decl)
+import           Apigen.Parser.AST          (Decl)
 import           Control.Arrow              (Arrow (first))
 import           Control.Monad.State.Strict (State)
 import qualified Control.Monad.State.Strict as State
