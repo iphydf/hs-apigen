@@ -1,205 +1,148 @@
-{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE Strict            #-}
-{-# LANGUAGE StrictData        #-}
-{-# LANGUAGE TupleSections     #-}
-module Apigen.Language.Haskell where
+-- | Haskell bindings for hs-toxcore-c: raw FFI modules under @FFI.Tox@, and
+-- the safe API under @Network.Tox.C@.
+module Apigen.Language.Haskell
+    ( generate
+    ) where
 
-import           Control.Monad.State.Strict  (State)
-import qualified Control.Monad.State.Strict  as State
-import           Data.Fix                    (Fix (..))
-import           Data.Maybe                  (catMaybes)
-import           Data.Text                   (Text)
-import qualified Data.Text                   as Text
-import           Language.Cimple             (Lexeme (..), LexemeClass (..),
-                                              Node, NodeF (..))
-import           Language.Cimple.TraverseAst (AstActions, astActions, doNode,
-                                              traverseAst)
-import qualified Text.Casing                 as Casing
+import qualified Apigen.Knowledge                  as K
+import           Apigen.Language.Haskell.AST
+import           Apigen.Language.Haskell.Callbacks (callbackDecls)
+import           Apigen.Language.Haskell.Events    (eventsModule)
+import           Apigen.Language.Haskell.Haddock   (DocContext (..), haddock)
+import           Apigen.Language.Haskell.Imports   (Entry (..), Scope,
+                                                    baseScope, declNames,
+                                                    importsFor, scopeOf)
+import           Apigen.Language.Haskell.Model     (callbackType, handleName,
+                                                    handleResources)
+import           Apigen.Language.Haskell.Options   (optionsModule)
+import           Apigen.Language.Haskell.Pretty    (renderModule)
+import           Apigen.Language.Haskell.Raw       (rawFunctions, rawModules)
+import           Apigen.Language.Haskell.Safe      (SafeFunction (..),
+                                                    safeDecls, safeFunctions)
+import           Apigen.Language.Haskell.Types     (constantNames,
+                                                    constantsModule,
+                                                    typesConstructors,
+                                                    typesExports, typesModule)
+import           Apigen.Parser.Docs                (Docs (..))
+import           Apigen.Semantic
+import           Data.List                         (find, nub)
+import qualified Data.Map.Strict                   as Map
+import           Data.Maybe                        (listToMaybe, mapMaybe)
+import           Data.Text                         (Text)
+import qualified Data.Text                         as Text
 
-
-joinLines :: [Text] -> Text
-joinLines = Text.intercalate "\n"
-
-
-idToHaskell :: Text -> Text
-idToHaskell =
-    Text.pack
-    . Casing.toPascal
-    . Casing.Identifier
-    . dropNamespace
-    . Casing.unIdentifier
-    . Casing.fromSnake
-    . Text.unpack
+generate :: Docs -> SemanticModel -> [(FilePath, Text)]
+generate docs model = [ (modulePath m, renderModule m) | m <- modules ]
   where
-    -- Drop the first component of the name, but only if there are at least
-    -- 2 components.
-    dropNamespace (_:name@(_:_)) = name
-    dropNamespace name           = name
+    functions = safeFunctions model
 
+    -- What a doc in a module links to, qualified where it's in another.
+    links here name = qualify <$> lookup name targets
+      where
+        qualify (m, n) = if m == here then n else m <> "." <> n
+    targets =
+        [ (sfCName f, (sfModule f, sfName f)) | f <- functions ]
+        ++ [ (c, ("Network.Tox.C.Constants", n)) | (c, n) <- constantNames model ]
+    docIn here fn params =
+        haddock (DocContext params (links here)) <$> Map.lookup fn (funcDocs docs)
+    memberDoc enum member =
+        haddock (DocContext [] (links "Network.Tox.C.Types")) <$> Map.lookup (enum, member) (enumMemberDocs docs)
+    optionDoc member =
+        haddock (DocContext [] (links "Network.Tox.C.Options")) <$> (settingsName >>= \n -> Map.lookup (n, member) (structMemberDocs docs))
+    settingsName = cName <$> listToMaybe (K.handlesOfKind model SettingsHandle)
 
-maybeParen :: Text -> Text
-maybeParen name
-    | ' ' `elem` Text.unpack name = "(" <> name <> ")"
-    | otherwise                   = name
+    av = find (K.keepsHandler model) (resources model)
+    avCallbacks = maybe Nothing (callbackDecls (docIn "Network.Tox.C.Av") model) av
 
+    functionModules = nub (map sfModule functions)
+    modules =
+        rawModules model
+        ++ [ constantsModule (\fn -> docIn "Network.Tox.C.Constants" fn []) model
+           , typesModule (\fn -> docIn "Network.Tox.C.Types" fn [], memberDoc) model
+           ]
+        ++ [ moduleFrom model name (lookup name moduleDocs) (decls ++ extraDecls) (exports ++ extraExports)
+           | name <- functionModules
+           , let own = filter ((== name) . sfModule) functions
+                 decls = concatMap (\f -> safeDecls (\fn -> docIn name fn (sfParams f)) f) own
+                 exports = map (ExportVar . sfName) own
+                 (extraDecls, extraExports) = case avCallbacks of
+                     Just (ds, names) | name == "Network.Tox.C.Av" -> (ds, map ExportVar names)
+                     _                                         -> ([], [])
+           ]
+        ++ [ moduleFrom model "Network.Tox.C.Options" (lookup "Network.Tox.C.Options" moduleDocs) ds es
+           | Just (ds, es) <- [optionsModule optionDoc model] ]
+        ++ [ moduleFrom model "Network.Tox.C.Events" (lookup "Network.Tox.C.Events" moduleDocs) ds es
+           | Just (ds, es) <- [eventsModule (docIn "Network.Tox.C.Events") model] ]
+        ++ [ topModule (functionModules ++ ["Network.Tox.C.Options", "Network.Tox.C.Events"]) ]
 
-isErrorEnum :: Text -> Bool
-isErrorEnum tyName =
-    case Casing.unIdentifier . Casing.fromSnake . Text.unpack $ tyName of
-        (_:"Err":_) -> True
-        _           -> False
-
-
-genStdType :: Text -> Text
-genStdType "uint16_t" = "Word16"
-genStdType "uint32_t" = "Word32"
-genStdType "uint64_t" = "Word64"
-genStdType "size_t"   = "CSize"
-genStdType "bool"     = "Bool"
-genStdType tyName     = error $ show tyName
-
-
-genType :: Node (Lexeme Text) -> Text
-genType                               (Fix (TyUserDefined (L _ IdSueType tyName))) =
-    "CEnum " <> idToHaskell tyName
-genType (Fix (TyPointer               (Fix (TyUserDefined (L _ IdSueType tyName)))  ))
-    | isErrorEnum tyName = "CErr " <> idToHaskell tyName
-    | otherwise = idToHaskell tyName <> "Ptr"
-
-genType (Fix (TyPointer (Fix (TyConst (Fix (TyUserDefined (L _ IdSueType tyName))))))) =
-    idToHaskell tyName <> "Ptr"
-genType (Fix (TyPointer (Fix (TyConst (Fix (TyStruct (L _ IdSueType tyName))))))) =
-    idToHaskell tyName <> "Ptr"
-genType (Fix (TyPointer               (Fix (TyStruct (L _ IdSueType tyName)))  )) =
-    idToHaskell tyName <> "Ptr"
-
-genType (Fix (TyPointer               (Fix (TyStd (L _ IdStdType "uint8_t")))  )) =
-    "CString"
-genType (Fix (TyPointer (Fix (TyConst (Fix (TyStd (L _ IdStdType "uint8_t"))))))) =
-    "CString"
-genType (Fix (TyPointer (Fix (TyConst (Fix (TyStd (L _ IdStdType "char"))))))) =
-    "CString"
-
-genType (Fix (TyPointer (Fix (TyStd (L _ KwVoid _))))) =
-    "Ptr ()"
-genType (Fix (TyPointer (Fix (TyFunc (L _ IdFuncType tyName))))) =
-    "FunPtr " <> idToHaskell tyName
-genType                 (Fix (TyStd (L _ IdStdType tyName))) =
-    genStdType tyName
-genType (Fix (TyPointer (Fix (TyStd (L _ IdStdType tyName))))) =
-    "Ptr " <> genStdType tyName
-genType (Fix (TyStd (L _ KwVoid _))) =
-    "()"
-genType ty = error $ show ty
-
-
-genArg :: Node (Lexeme Text) -> Text
-genArg (Fix (VarDecl ty _ _)) = genType ty
-genArg arg                    = error $ show arg
-
-
-genArgs :: [Node (Lexeme Text)] -> Text
-genArgs args = Text.intercalate " -> " (map genArg args) <> " -> "
-
-
-genFunction :: Node (Lexeme Text) -> Text -> [Node (Lexeme Text)] -> Text
-genFunction retTy name [(Fix (TyStd (L _ KwVoid _)))] =
-    "foreign import ccall " <> name <> " :: " <> genType retTy
-genFunction retTy name args =
-    "foreign import ccall " <> name <> " :: " <> genArgs args <> "IO " <> maybeParen (genType retTy)
-
-
-genFuncType :: Node (Lexeme Text) -> Text -> [Node (Lexeme Text)] -> Text
-genFuncType retTy name args = joinLines
-    [ "type " <> hsName <> " = " <> genArgs args <> "IO " <> maybeParen (genType retTy)
-    , "foreign import ccall \"wrapper\" wrap" <> hsName <> " :: " <> hsName <> " -> IO (FunPtr " <> hsName <> ")"
-    ]
-  where
-    hsName = idToHaskell name
-
-
-genEnumerator :: Bool -> Node (Lexeme Text) -> Maybe Text
-genEnumerator isErr (Fix (Enumerator (L _ _ name) _))
-    -- Skip the OK error, because we process that in CErr handling.
-    | isErr && "_OK" `Text.isSuffixOf` name = Nothing
-    | otherwise                             = Just $ idToHaskell name
-genEnumerator _ (Fix Comment{}) = Nothing
-genEnumerator _ x = error $ show x
-
-
-genEnum :: Text -> [Node (Lexeme Text)] -> Text
-genEnum name enums = joinLines $
-    [ "data " <> hsName
-    , "    = " <> Text.intercalate "\n    | " (catMaybes (map (genEnumerator (isErrorEnum name)) enums))
-    , "    deriving (Eq, Ord, Enum, Bounded, Read, Show, Generic)"
-    , "instance MessagePack " <> hsName
-    , "instance Arbitrary " <> hsName <> " where arbitrary = arbitraryBoundedEnum"
-    ]
-  where
-    hsName = idToHaskell name
-
-
-genStruct :: Text -> Text
-genStruct name = joinLines $
-    [ "data " <> structName
-    , "type " <> ptrName <> " = Ptr " <> structName
-    ]
-  where
-    structName = idToHaskell name <> "Struct"
-    ptrName    = idToHaskell name <> "Ptr"
-
-
-generator :: AstActions (State [Text]) Text
-generator = astActions
-    { doNode = \_file node act ->
-        case unFix node of
-            FunctionDecl _ (Fix (FunctionPrototype retTy (L _ _ name) args)) ->
-                State.modify (genFunction retTy name args:)
-            Struct (L _ _ name) _ ->
-                State.modify (genStruct name:)
-            Typedef _ (L _ _ name) ->
-                State.modify (genStruct name:)
-            TypedefFunction (Fix (FunctionPrototype retTy (L _ _ name) args)) ->
-                State.modify (genFuncType retTy name args:)
-            EnumDecl (L _ _ name) enums _ ->
-                State.modify (genEnum name enums:)
-            EnumConsts (Just (L _ _ name)) enums ->
-                State.modify (genEnum name enums:)
-
-            _ -> act
+moduleFrom :: SemanticModel -> Text -> Maybe Text -> [Decl] -> [Export] -> Module
+moduleFrom model name doc decls exports = Module
+    { modName    = name
+    , modDoc     = doc
+    , modPragmas = []
+    , modExports = Just exports
+    , modImports = importsFor (safeScope model) (rawImports model decls) decls
+    , modDecls   = decls
     }
 
-
-addPrologue :: FilePath -> [Text] -> [Text]
-addPrologue file = (
-    [ "{-# LANGUAGE DeriveGeneric #-}"
-    , "{-# OPTIONS_GHC -Wno-unused-imports #-}"
-    , "module " <> hsModuleName file <> " where"
-    , ""
-    , "import           Data.MessagePack          (MessagePack)"
-    , "import           Data.Word                 (Word16, Word32, Word64)"
-    , "import           Foreign.C.Enum            (CEnum (..), CErr)"
-    , "import           Foreign.C.String          (CString)"
-    , "import           Foreign.C.Types           (CInt (..), CSize (..))"
-    , "import           Foreign.Ptr               (FunPtr, Ptr)"
-    , "import           GHC.Generics              (Generic)"
-    , "import           Test.QuickCheck.Arbitrary (Arbitrary (..),"
-    , "                                            arbitraryBoundedEnum)"
-    , if "tox/tox_events.h" `Text.isSuffixOf` Text.pack file then "import FFI.Tox.Tox" else ""
-    ]++)
+-- | @Network.Tox.C@, re-exporting the safe API.
+topModule :: [Text] -> Module
+topModule safeModules = Module
+    { modName    = "Network.Tox.C"
+    , modDoc     = Just "The Tox API, safe to use from Haskell. Start with 'withTox'."
+    , modPragmas = []
+    , modExports = Just $
+        map ExportModule reexported
+        ++ [ExportVar "FixedBytes (fixedSize, toBytes)", ExportVar "fromBytes"]
+    , modImports =
+        [ Import m Nothing Nothing | m <- reexported ]
+        ++ [Import "Network.Tox.C.Marshal" Nothing (Just ["FixedBytes (fixedSize, toBytes)", "fromBytes"])]
+    , modDecls   = []
+    }
   where
-    hsModuleName =
-        ("FFI."<>)
-        . Text.intercalate "."
-        . map (Text.pack . Casing.toPascal . Casing.Identifier . (:[]) . Text.unpack)
-        . reverse . take 2 . reverse  -- takeEnd from extra
-        . Text.splitOn "/"
-        . Text.dropEnd 2
-        . Text.pack
+    reexported =
+        ["Network.Tox.C.Constants", "Network.Tox.C.Types", "Network.Tox.C.Lifecycle"]
+        ++ safeModules
 
-
-generate :: (FilePath, [Node (Lexeme Text)]) -> (FilePath, Text)
-generate input@(file, _) = go input
+safeScope :: SemanticModel -> Scope
+safeScope model =
+    baseScope
+    <> Map.fromList (concatMap entry (typesExports model))
+    <> Map.fromList [ (h, Entry types h (h <> " (..)")) | h <- handles ]
+    <> Map.fromList [ (c, Entry types (t <> " (..)") (t <> " (..)")) | (c, t) <- typesConstructors model ]
+    <> scopeOf "Network.Tox.C.Constants" (map snd (constantNames model))
+    <> scopeOf "FFI.Tox.Types" [ handleName r <> "Ptr" | r <- resources model, resourceType r == ResHandle ]
   where
-    go = (file,) . joinLines . addPrologue file . reverse . flip State.execState [] . traverseAst generator
+    entry e = case e of
+        ExportAll n     -> [(n, Entry types n (n <> " (..)"))]
+        ExportVar n     -> [(n, Entry types n n)]
+        ExportPattern n -> [(n, Entry types ("pattern " <> n) ("pattern " <> n))]
+        _               -> []
+    types = "Network.Tox.C.Types"
+    handles = [ handleName r | r <- resources model, resourceName r `elem` handleResources model ]
+
+rawImports :: SemanticModel -> [Decl] -> [Text]
+rawImports model decls =
+    nub (mapMaybe (`lookup` index) (mapMaybe (Text.stripPrefix "Raw." . snd) (concatMap declNames decls)))
+  where
+    index = [ (hsName d, m) | (m, d) <- rawFunctions model ]
+        ++ [ ("wrap" <> callbackType (cbName cb), "FFI.Tox.Types") | cb <- callbacks model ]
+    hsName (Foreign _ n _) = n
+    hsName _               = ""
+
+moduleDocs :: [(Text, Text)]
+moduleDocs =
+    [ ("Network.Tox.C.Tox", "A Tox instance: its own address, name and status, its connections, and its save data.")
+    , ("Network.Tox.C.Friend", "Friends: adding and removing them, what they say about themselves, and messages and packets to them.")
+    , ("Network.Tox.C.File", "File transfers with friends.")
+    , ("Network.Tox.C.Conference", "Conferences, the older group chats, and their peers.")
+    , ("Network.Tox.C.Group", "Group chats and their peers.")
+    , ("Network.Tox.C.Av", "Audio and video calls with friends.")
+    , ("Network.Tox.C.EncryptSave", "Encrypting and decrypting data, such as save data, with a passphrase.")
+    , ("Network.Tox.C.Options", "The options a Tox instance starts with.")
+    , ("Network.Tox.C.Events", "What happened since the last iteration, as Tox records it.")
+    ]
+
+modulePath :: Module -> FilePath
+modulePath m = Text.unpack (Text.replace "." "/" (modName m)) <> ".hs"
