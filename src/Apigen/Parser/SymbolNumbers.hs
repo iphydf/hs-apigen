@@ -1,7 +1,8 @@
+{-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections     #-}
 {-# OPTIONS_GHC -Wwarn #-}
-module Apigen.Parser.SymbolNumbers where
+module Apigen.Parser.SymbolNumbers (module Apigen.Parser.SymbolNumbers, module Apigen.Patterns) where
 
 import           Apigen.Parser.SymbolTable  (NameToSId, SIdToName)
 import           Apigen.Patterns
@@ -26,6 +27,8 @@ builtins = HashMap.fromList
     , (([], ["TOX","HIDE","DEPRECATED"]), SYM_TOX_HIDE_DEPRECATED)
     , (([], ["void"      ]), TY_void    )
     , (([], ["char"      ]), TY_char    )
+    , (([], ["int"       ]), TY_int     )
+    , (([], ["unsigned"  ]), TY_unsigned)
     , (([], ["bool"      ]), TY_bool    )
     , (([], ["int8","t"  ]), TY_int8_t  )
     , (([], ["uint8","t" ]), TY_uint8_t )
@@ -38,6 +41,7 @@ builtins = HashMap.fromList
     , (([], ["size","t"  ]), TY_size_t  )
     , (([], ["abs"       ]), SYM_abs    )
     , (([], ["max"       ]), SYM_max    )
+    , (([], ["sizeof"    ]), SYM_sizeof )
     ]
 
 symtabActions :: HasCallStack => AstActions (State NameToSId) Text Int

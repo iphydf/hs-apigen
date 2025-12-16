@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Regenerate every apigen-produced binding from the c-toxcore headers and
+# verify all backends still work.
+#
+# Run this after any change to apigen (hs-apigen/) or the c-toxcore public
+# headers. It regenerates the Rust bindings (rs-toxcore-c/), the Cython
+# bindings (py_toxcore_c/), and the JVM bindings (jvm-toxcore-c/), refreshes
+# the Python type stubs, and runs every downstream test suite. If a backend
+# regresses (different generated output, FFI mistake, type-stub drift, test
+# failure), this is where it surfaces.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+HSAPIGEN_DIR="$(dirname "$SCRIPT_DIR")"
+WORKSPACE_DIR="$(dirname "$HSAPIGEN_DIR")"
+
+set -eux
+
+cd "$WORKSPACE_DIR"
+
+HEADERS=(
+  c-toxcore/toxcore/tox.h
+  c-toxcore/toxcore/tox_attributes.h
+  c-toxcore/toxcore/tox_events.h
+  c-toxcore/toxcore/tox_log_level.h
+  c-toxcore/toxcore/tox_options.h
+  c-toxcore/toxav/toxav.h
+  c-toxcore/toxencryptsave/toxencryptsave.h
+)
+
+bazel build //hs-apigen/tools:apigen
+
+# One apigen invocation, every backend — they share a single parse of the
+# headers and a single round-trip self-check.
+bazel-bin/hs-apigen/tools/apigen \
+  --rs-out rs-toxcore-c/toxcore/src/core/generated \
+  --py-out py_toxcore_c/pytox \
+  --jvm-out jvm-toxcore-c \
+  "${HEADERS[@]}"
+
+# stubgen introspects the compiled Cython extension to refresh the .pyi
+# stubs; the build is implicit in `bazel run`.
+bazel run //py_toxcore_c/tools:stubgen -- py_toxcore_c
+
+# Every downstream test suite — the only honest way to know all backends
+# keep working.
+bazel test \
+  //hs-apigen/... \
+  //rs-toxcore-c/... \
+  //py_toxcore_c/... \
+  //jvm-toxcore-c/...
